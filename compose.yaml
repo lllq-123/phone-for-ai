@@ -1,0 +1,14 @@
+services:
+  phone-for-ai:
+    build: .
+    restart: unless-stopped
+    environment:
+      PHONE_FOR_AI_STATE_DIR: /data
+    volumes:
+      - phone-for-ai-state:/data
+    ports:
+      - "127.0.0.1:8765:8765"
+
+volumes:
+  phone-for-ai-state:
+

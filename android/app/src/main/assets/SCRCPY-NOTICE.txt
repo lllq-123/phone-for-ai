@@ -1,0 +1,5 @@
+The bundled scrcpy server 4.1 is copied without modification from Genymobile/scrcpy:
+https://github.com/Genymobile/scrcpy/releases/tag/v4.1
+
+scrcpy is licensed under Apache License 2.0. The accompanying license text is
+stored in SCRCPY-LICENSE.txt.

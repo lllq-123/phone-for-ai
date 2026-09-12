@@ -1,0 +1,4 @@
+# Replace with a domain whose DNS points to your server.
+phone.example.com {
+    reverse_proxy 127.0.0.1:8765
+}

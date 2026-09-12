@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <title>Phone for AI · 手机在手边</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div class="desk">
+    <header class="masthead">
+      <a class="brand" href="/" aria-label="Phone for AI 首页"><span class="brand-mark" aria-hidden="true">&gt;_</span><span>Phone for AI<small>给 AI 一台手机</small></span></a>
+      <a class="guide-link" href="https://github.com/lllq-123/phone-for-ai/blob/main/docs/setup.md" target="_blank" rel="noreferrer">使用说明 <span aria-hidden="true">↗</span></a>
+    </header>
+    <main class="workspace">
+      <aside class="introduction">
+        <p class="eyebrow">A LITTLE WINDOW</p>
+        <h1>你的手机，<br>在手边。</h1>
+        <p class="intro-copy">给远方的小身体开一扇窗。<br>看它的屏幕，也亲手点点它。</p>
+        <section class="connection" aria-labelledby="connection-title">
+          <h2 id="connection-title"><span class="section-number">01</span>连接你的手机</h2>
+          <form id="connect-form">
+            <label for="token">控制密钥</label>
+            <div class="token-field"><input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴 operator token" aria-describedby="token-hint"><label class="file-button" for="token-file" title="从 operator.token 文件读取">选文件<input id="token-file" type="file" hidden></label></div>
+            <p class="field-hint" id="token-hint">只在当前页面记住，关掉页面就忘记。</p>
+            <button class="button primary" id="connect" type="submit"><span>连接实时画面</span><span aria-hidden="true">↗</span></button>
+          </form>
+          <div class="secondary-actions"><button id="snapshot" class="text-button" type="button">查看一张截图</button><button id="disconnect" class="text-button stop" type="button" disabled>停止连接</button></div>
+        </section>
+        <div class="device-note"><span class="note-dot" aria-hidden="true"></span><p id="device-detail">手机需要先配对。实时控制还需要手机开启 Root 扩展。</p></div>
+        <p class="little-note">先连接，再碰一碰屏幕。<br>小事，也可以一起完成。</p>
+      </aside>
+      <section class="screen-section" aria-label="手机画面与操作">
+        <div class="screen-heading"><span class="screen-label">PHONE VIEW</span><span id="status-badge" class="status-badge" data-phase="idle"><i></i><span>等待连接</span></span></div>
+        <div class="screen-stage">
+          <div class="phone-shell" id="phone-shell">
+            <div class="phone-display">
+              <canvas id="screen" width="9" height="20" aria-label="手机实时画面，连接后可点按、拖动和长按" tabindex="0" hidden></canvas>
+              <img id="snapshot-image" alt="手机当前页面的单张截图" hidden>
+              <div id="empty-screen" class="empty-screen"><div class="cloud-face" aria-hidden="true">&gt;_</div><p id="empty-title">这里，会是你的手机。</p><span id="empty-detail">第一次连接前<br>先让手机伙伴完成配对</span></div>
+            </div>
+          </div>
+          <span class="paper-label" aria-hidden="true">a small window<br>to everyday life</span>
+        </div>
+        <nav class="phone-nav" aria-label="手机导航"><button data-key="4" disabled><span aria-hidden="true">‹</span>返回</button><button data-key="3" disabled><span aria-hidden="true">○</span>桌面</button><button data-key="187" disabled><span aria-hidden="true">▢</span>最近</button></nav>
+        <p class="status-message" id="status-message" role="status" aria-live="polite">连接后，点按、滑动和长按会直接落在手机上。</p>
+      </section>
+      <aside class="right-rail">
+        <section class="writing-pad" aria-labelledby="text-title"><p class="eyebrow">SEND A LITTLE TEXT</p><h2 id="text-title">把字递过去</h2><p>先点手机里的输入框，<br>再在这里写。</p><form id="text-form"><label class="sr-only" for="phone-text">要输入到手机的文字</label><textarea id="phone-text" maxlength="2000" placeholder="中文、换行，都可以。" disabled></textarea><div class="text-bottom"><span id="text-count">0 / 2000</span><button class="button small" id="send-text" disabled type="submit">输入到手机 ↗</button></div></form><small>只输入文字，发送由你点。</small></section>
+        <section class="how-to" aria-labelledby="how-title"><h2 id="how-title">一点使用默契</h2><ol><li><span>点一下</span>就像用手指碰屏幕。</li><li><span>按住拖动</span>可以滑动，也可以长按。</li><li><span>离开页面</span>实时画面与控制会停止。</li></ol><p>你连接时，由你接管。<br>停止连接后，agent 再继续。</p></section>
+      </aside>
+    </main>
+    <footer><span>你的设备 · 你的服务 · 你来做主</span><a href="https://github.com/lllq-123/phone-for-ai" target="_blank" rel="noreferrer">在 GitHub 上一起造点小东西 ↗</a></footer>
+  </div>
+</body>
+</html>
