@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from types import SimpleNamespace
 
 import pytest
@@ -161,3 +162,21 @@ def test_slow_stream_delete_keeps_command_queue_reserved(tmp_path):
         await delete_task
         assert relay.session is None
     asyncio.run(scenario())
+
+
+def test_files_write_is_redacted_for_operator_but_complete_for_device(tmp_path):
+    service=BridgeService(tmp_path,"operator")
+    client=TestClient(create_app(service))
+    enrollment=client.post("/api/phone/enrollment",headers=auth("operator"),json={"ttl_seconds":60}).json()
+    device=client.post("/api/phone/enroll",json={"enrollment_code":enrollment["enrollment_code"],"app_version":"1","capabilities":{"file_access":True}}).json()
+    client.post("/api/phone/heartbeat",headers=auth(device["device_token"]),json={"app_version":"1","capabilities":{"file_access":True},"status":{},"long_poll_seconds":0})
+    encoded=base64.b64encode(b"private image bytes").decode()
+    queued=client.post("/api/phone/commands",headers=auth("operator"),json={"type":"files.write","args":{"path":"/sdcard/Pictures/image.jpg","data_base64":encoded,"append":False}}).json()
+    assert queued["command"]["args"] == {
+        "path":"/sdcard/Pictures/image.jpg","append":False,
+        "data_bytes":len(b"private image bytes"),"data_base64_omitted":True,
+    }
+    status=client.get("/api/phone/status",headers=auth("operator")).json()
+    assert encoded not in str(status)
+    delivered=client.post("/api/phone/heartbeat",headers=auth(device["device_token"]),json={"app_version":"1","capabilities":{"file_access":True},"status":{},"long_poll_seconds":0}).json()["command"]
+    assert delivered["args"]["data_base64"] == encoded

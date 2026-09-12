@@ -362,6 +362,14 @@ class BridgeService:
     def _public_command(self, command: dict[str, Any], *, for_device: bool = False) -> dict[str, Any]:
         keys = ("id", "type", "args", "status", "ok", "result", "error", "delivery_uncertain", "cancellation_kind", "artifact_expired")
         result = {key: command.get(key) for key in keys if key in command}
+        if not for_device and command.get("type") == "files.write" and isinstance(result.get("args"), dict):
+            public_args = dict(result["args"])
+            encoded = public_args.pop("data_base64", None)
+            if isinstance(encoded, str):
+                # Stored command args were already strict Base64-validated.
+                public_args["data_bytes"] = len(base64.b64decode(encoded, validate=True))
+                public_args["data_base64_omitted"] = True
+            result["args"] = public_args
         for key in ("created_at", "expires_at", "delivered_at", "completed_at"):
             result[key] = _iso(command.get(key))
         artifact = self._artifact_public(command.get("artifact"))
