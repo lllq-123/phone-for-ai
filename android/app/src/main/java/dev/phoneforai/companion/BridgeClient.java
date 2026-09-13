@@ -131,6 +131,10 @@ final class BridgeClient {
             if (!knownStreamId.isEmpty()) request.put("known_stream_id", knownStreamId);
             JSONObject response = post(baseUrl(context), "/heartbeat", request,
                     prefs(context).getString(TOKEN, ""), owner);
+            // ColorOS can omit a later SCREEN_OFF delivery even while the dynamic
+            // receiver remains registered. A successful heartbeat is an existing
+            // wake-up point where the actual interactive state can repair that miss.
+            PhoneAccessibilityService.requestScreenPowerStateSync();
             prefs(context).edit().putLong(LAST_OK, System.currentTimeMillis()).putString(LAST_ERROR, "").apply();
             JSONObject command = response.optJSONObject("command");
             if (command != null) dispatch(context, command);

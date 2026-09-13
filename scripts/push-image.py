@@ -33,6 +33,22 @@ def completed(client: ApiClient, kind: str, args: dict) -> dict:
     return data
 
 
+def media_scan_command(target: PurePosixPath, size: int) -> str:
+    # Android 14 may accept the old scan broadcast without delivering it to a
+    # receiver. Ask MediaProvider to scan, then require an indexed row of the
+    # expected size. Resolve /sdcard before querying its canonical _data path.
+    return (
+        f"pfa_path=$(readlink -f {shlex.quote(str(target))})"
+        ' && test -n "$pfa_path"'
+        ' && content call --uri content://media --method scan_file --arg "$pfa_path"'
+        ' && pfa_sql=$(printf %s "$pfa_path" | sed "s/\x27/\x27\x27/g")'
+        ' && pfa_row=$(content query --uri content://media/external/images/media'
+        ' --projection _data:_size --where "_data=\x27$pfa_sql\x27")'
+        ' && printf "%s\\n" "$pfa_row"'
+        f' && printf "%s\\n" "$pfa_row" | grep -Eq \'(^|[ ,])_size={size}([, ]|$)\''
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
@@ -69,14 +85,14 @@ def main() -> int:
             f" && test ! -e {q(str(target))}"
             f" && mv -n {q(str(staging))} {q(str(target))}"
             f" && test ! -e {q(str(staging))}"
-            f" && am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d {q('file://' + str(target))}"
+            f" && {media_scan_command(target, size)}"
         )
         shell(verify)
-        print(json.dumps({"ok": True, "path": str(target), "bytes": size, "sha256": digest.hexdigest(),
+        print(json.dumps({"ok": True, "path": str(target), "bytes": size, "sha256": digest.hexdigest(), "media_indexed": True,
             "next": "Open the app album picker and confirm the image is visible."}, ensure_ascii=False, indent=2))
         return 0
     except (OSError, RuntimeError, ValueError) as error:
-        print(f"Upload stopped: {error}\nStaging path: {staging}\nInspect the original command before retrying; a timeout does not undo a write.", file=sys.stderr)
+        print(f"Upload stopped: {error}\nStaging path: {staging}\nTarget path: {target}\nInspect the original command and both paths before retrying; a timeout does not undo a write. If the target is already complete, rescan it instead of uploading again.", file=sys.stderr)
         return 1
 
 

@@ -3,9 +3,12 @@ package dev.phoneforai.companion;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.app.KeyguardManager;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.graphics.Bitmap;
 import android.graphics.ColorSpace;
 import android.graphics.Path;
@@ -30,6 +33,10 @@ public final class PhoneAccessibilityService extends AccessibilityService {
     private static final Pattern ID = Pattern.compile("^[A-Za-z0-9_-]{1,128}$");
     private static final Pattern PACKAGE = Pattern.compile("^[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+$");
     private static final long BASIS_MAX_AGE_MS = 180_000L;
+    private static final int WAKE_MAX_ATTEMPTS = 40;
+    private static final long WAKE_RETRY_DELAY_MS = 150L;
+    private static final long WAKE_UNLOCK_READY_DELAY_MS = 700L;
+    private static final long WAKE_SETTLE_DELAY_MS = 1_200L;
     private static volatile PhoneAccessibilityService instance;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -42,10 +49,22 @@ public final class PhoneAccessibilityService extends AccessibilityService {
     private int basisWidth;
     private int basisHeight;
     private long basisCapturedAt;
-    private PowerManager.WakeLock pollWakeLock;
+    private boolean wakeDismissGestureScheduled;
+    private boolean wakeDismissGestureDispatched;
+    private BroadcastReceiver screenPowerReceiver;
+    private PowerManager.WakeLock lockedScreenWakeLock;
 
     static boolean isConnected() { return instance != null; }
     static boolean isCommandBusy() { PhoneAccessibilityService service = instance; return service != null && service.busy; }
+    static void requestScreenPowerStateSync() {
+        PhoneAccessibilityService expected = instance;
+        if (expected == null) return;
+        expected.handler.post(() -> {
+            // A queued heartbeat correction must not reacquire a lock after this
+            // accessibility-service instance has been destroyed or replaced.
+            if (instance == expected) expected.updateLockedScreenWakeLock();
+        });
+    }
     static boolean submit(JSONObject command) {
         PhoneAccessibilityService service = instance;
         if (service == null || command == null) return false;
@@ -58,14 +77,10 @@ public final class PhoneAccessibilityService extends AccessibilityService {
     }
 
     @Override protected void onServiceConnected() {
+        super.onServiceConnected();
         instance = this;
-        PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
-        if (power != null) {
-            pollWakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
-                    "phoneforai:command-poll");
-            pollWakeLock.setReferenceCounted(false);
-            pollWakeLock.acquire();
-        }
+        registerScreenPowerReceiver();
+        updateLockedScreenWakeLock();
         BridgeClient.start(this);
     }
 
@@ -83,7 +98,8 @@ public final class PhoneAccessibilityService extends AccessibilityService {
         if (instance == this) instance = null;
         handler.removeCallbacksAndMessages(null);
         basisValid = false;
-        if (pollWakeLock != null && pollWakeLock.isHeld()) pollWakeLock.release();
+        unregisterScreenPowerReceiver();
+        releaseLockedScreenWakeLock();
         super.onDestroy();
     }
 
@@ -101,7 +117,7 @@ public final class PhoneAccessibilityService extends AccessibilityService {
         catch (IllegalArgumentException error) { fail(id, "invalid_command_args"); return; }
 
         KeyguardManager keyguard = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
-        if ("screen.wake".equals(type)) { begin(id); wakeThenCapture(id, options, 0); return; }
+        if ("screen.wake".equals(type)) { wake(id, options, keyguard); return; }
         if (keyguard != null && keyguard.isDeviceLocked()) { fail(id, "device_locked"); return; }
         if ("screen.capture".equals(type)) { begin(id); capture(id, options); return; }
         if ("app.launch".equals(type)) {
@@ -133,21 +149,180 @@ public final class PhoneAccessibilityService extends AccessibilityService {
     }
     private void begin(String id) { busy = true; activeId = id; }
 
-    private void wakeThenCapture(String id, ScreenshotOptions options, int attempt) {
-        PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
-        if (attempt == 0 && (power == null || !power.isInteractive())) {
-            try { startActivity(new Intent(this, WakeActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); }
-            catch (RuntimeException error) { fail(id, "wake_failed"); return; }
-        }
-        KeyguardManager keyguard = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
-        if (power != null && power.isInteractive() && (keyguard == null || !keyguard.isDeviceLocked())) {
-            capture(id, options); return;
-        }
-        if (attempt >= 30) {
-            fail(id, keyguard != null && keyguard.isDeviceSecure() ? "secure_keyguard_locked" : "wake_failed");
+    private void wake(String id, ScreenshotOptions options, KeyguardManager keyguard) {
+        if (keyguard == null) { fail(id, "keyguard_service_missing"); return; }
+        if (WakeStatePolicy.secureKeyguardBlocks(
+                keyguard.isKeyguardLocked(), keyguard.isDeviceSecure())) {
+            fail(id, "secure_keyguard_present");
             return;
         }
-        handler.postDelayed(() -> wakeThenCapture(id, options, attempt + 1), 200L);
+        begin(id);
+        basisValid = false;
+        wakeDismissGestureScheduled = false;
+        wakeDismissGestureDispatched = false;
+        PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+        if (power != null && WakeStatePolicy.readyToCapture(
+                power.isInteractive(), keyguard.isKeyguardLocked())) {
+            captureWakeAfterSettle(id, options);
+            return;
+        }
+        Intent intent = new Intent(this, WakeActivity.class).addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_ACTIVITY_NO_ANIMATION
+                        | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
+        try { startActivity(intent); }
+        catch (RuntimeException error) { fail(id, "wake_activity_rejected"); return; }
+        handler.postDelayed(() -> awaitWakeAndCapture(id, options, 0), WAKE_RETRY_DELAY_MS);
+    }
+
+    private void awaitWakeAndCapture(String id, ScreenshotOptions options, int attempt) {
+        if (!busy || !id.equals(activeId)) return;
+        KeyguardManager keyguard = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+        if (keyguard == null || power == null) { fail(id, "wake_service_missing"); return; }
+        boolean keyguardLocked = keyguard.isKeyguardLocked();
+        if (WakeStatePolicy.secureKeyguardBlocks(keyguardLocked, keyguard.isDeviceSecure())) {
+            fail(id, "secure_keyguard_present");
+            return;
+        }
+        boolean interactive = power.isInteractive();
+        if (WakeStatePolicy.readyToCapture(interactive, keyguardLocked)) {
+            captureWakeAfterSettle(id, options);
+            return;
+        }
+        if (WakeStatePolicy.shouldDispatchUnlockGesture(
+                interactive, keyguardLocked,
+                wakeDismissGestureScheduled || wakeDismissGestureDispatched)) {
+            scheduleWakeDismissGesture(id, options, attempt);
+            return;
+        }
+        if (attempt >= WAKE_MAX_ATTEMPTS) { fail(id, "wake_timeout"); return; }
+        handler.postDelayed(
+                () -> awaitWakeAndCapture(id, options, attempt + 1),
+                WAKE_RETRY_DELAY_MS);
+    }
+
+    private void scheduleWakeDismissGesture(
+            String id,
+            ScreenshotOptions options,
+            int attempt
+    ) {
+        wakeDismissGestureScheduled = true;
+        handler.postDelayed(() -> {
+            if (!busy || !id.equals(activeId)) return;
+            wakeDismissGestureScheduled = false;
+            KeyguardManager keyguard = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+            PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+            if (keyguard == null || power == null) { fail(id, "wake_service_missing"); return; }
+            boolean keyguardLocked = keyguard.isKeyguardLocked();
+            if (WakeStatePolicy.secureKeyguardBlocks(keyguardLocked, keyguard.isDeviceSecure())) {
+                fail(id, "secure_keyguard_present");
+                return;
+            }
+            if (WakeStatePolicy.readyToCapture(power.isInteractive(), keyguardLocked)) {
+                captureWakeAfterSettle(id, options);
+                return;
+            }
+            if (!power.isInteractive()) {
+                awaitWakeAndCapture(id, options, attempt + 1);
+                return;
+            }
+            dispatchWakeDismissGesture(id, options);
+        }, WAKE_UNLOCK_READY_DELAY_MS);
+    }
+
+    private void dispatchWakeDismissGesture(String id, ScreenshotOptions options) {
+        wakeDismissGestureDispatched = true;
+        int width = getResources().getDisplayMetrics().widthPixels;
+        int height = getResources().getDisplayMetrics().heightPixels;
+        Path path = new Path();
+        path.moveTo(width * 0.5f, height * 0.82f);
+        path.lineTo(width * 0.5f, height * 0.22f);
+        GestureDescription gesture = new GestureDescription.Builder()
+                .addStroke(new GestureDescription.StrokeDescription(path, 0L, 350L))
+                .build();
+        boolean accepted = dispatchGesture(gesture, new GestureResultCallback() {
+            @Override public void onCompleted(GestureDescription description) {
+                handler.postDelayed(
+                        () -> awaitWakeAndCapture(id, options, 0),
+                        WAKE_SETTLE_DELAY_MS);
+            }
+            @Override public void onCancelled(GestureDescription description) {
+                fail(id, "wake_unlock_gesture_cancelled");
+            }
+        }, handler);
+        if (!accepted) fail(id, "wake_unlock_gesture_rejected");
+    }
+
+    private void captureWakeAfterSettle(String id, ScreenshotOptions options) {
+        handler.postDelayed(() -> {
+            if (!busy || !id.equals(activeId)) return;
+            KeyguardManager keyguard = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+            PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+            if (keyguard == null || power == null) { fail(id, "wake_service_missing"); return; }
+            boolean keyguardLocked = keyguard.isKeyguardLocked();
+            if (WakeStatePolicy.secureKeyguardBlocks(keyguardLocked, keyguard.isDeviceSecure())) {
+                fail(id, "secure_keyguard_present");
+                return;
+            }
+            if (!WakeStatePolicy.readyToCapture(power.isInteractive(), keyguardLocked)) {
+                fail(id, "wake_timeout");
+                return;
+            }
+            capture(id, options);
+        }, WAKE_SETTLE_DELAY_MS);
+    }
+
+    private void registerScreenPowerReceiver() {
+        if (screenPowerReceiver != null) return;
+        screenPowerReceiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context context, Intent intent) {
+                String action = intent.getAction();
+                if (Intent.ACTION_SCREEN_OFF.equals(action)) {
+                    setLockedScreenWakeLock(ScreenPowerPolicy.shouldHoldAfter(
+                            ScreenPowerPolicy.Change.SCREEN_OFF));
+                } else if (Intent.ACTION_SCREEN_ON.equals(action)) {
+                    setLockedScreenWakeLock(ScreenPowerPolicy.shouldHoldAfter(
+                            ScreenPowerPolicy.Change.SCREEN_ON));
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        registerReceiver(screenPowerReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+    }
+
+    private void unregisterScreenPowerReceiver() {
+        if (screenPowerReceiver == null) return;
+        try { unregisterReceiver(screenPowerReceiver); }
+        catch (IllegalArgumentException ignored) { }
+        screenPowerReceiver = null;
+    }
+
+    private void updateLockedScreenWakeLock() {
+        PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+        setLockedScreenWakeLock(power != null
+                && ScreenPowerPolicy.shouldHoldPartialWakeLock(power.isInteractive()));
+    }
+
+    private void setLockedScreenWakeLock(boolean shouldHold) {
+        if (!shouldHold) { releaseLockedScreenWakeLock(); return; }
+        PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+        if (power == null) return;
+        if (lockedScreenWakeLock == null) {
+            lockedScreenWakeLock = power.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "phoneforai:locked-screen-command-poll");
+            lockedScreenWakeLock.setReferenceCounted(false);
+        }
+        if (!lockedScreenWakeLock.isHeld()) lockedScreenWakeLock.acquire();
+    }
+
+    private void releaseLockedScreenWakeLock() {
+        if (lockedScreenWakeLock != null && lockedScreenWakeLock.isHeld()) {
+            lockedScreenWakeLock.release();
+        }
     }
 
     private void launch(String id, String packageName, ScreenshotOptions options) {

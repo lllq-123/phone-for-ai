@@ -50,6 +50,8 @@ UI basis fields: `basis_command_id`, `expected_package`. A UI action consumes th
 
 Capabilities: `accessibility`, `screen_capture`, `wake_screen`, `gestures`, `text_input`, `launch`, `ui_tree`, `clipboard`, `root_shell`, `file_access`, `app_inventory`, `screen_stream`. Advertise implementation availability honestly; actual Root denial remains an execution failure.
 
+Since Android companion 0.1.1, `screen.wake` waits for an interactive display and a dismissed keyguard, performs at most one swipe on a nonsecure keyguard, and checks those conditions again after the screen settles before capture. A locked secure keyguard returns `secure_keyguard_present`; wake failures such as `wake_timeout` do not produce a successful screenshot basis. Background operation also requires the device's battery optimization exemption and vendor background permissions; a partial wake lock alone does not guarantee network access.
+
 ## Live browser control
 
 The browser console is served at `/`. It keeps the operator token in memory, sends it in HTTP authorization headers, and never places tokens in URLs or local storage. The stream extension uses the existing scrcpy 4.1 H.264 transport, with Root required on the phone.

@@ -58,6 +58,11 @@ public final class MainActivity extends Activity {
         Button battery = button("打开后台电池设置");
         battery.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)));
         panel.addView(battery, params());
+        TextView batteryHelp = text(
+                "长期熄屏使用前，请把本应用加入电池优化白名单，并在 ColorOS 等系统中允许后台运行。熄屏时会保持 CPU 处理领命令和文件传输，这会增加耗电；Doze 仍可能限制网络，所以后台设置不可省略。",
+                14f,
+                Color.DKGRAY);
+        panel.addView(batteryHelp, params());
 
         baseUrl = new EditText(this); baseUrl.setHint("https://phone.example.com/api/phone");
         baseUrl.setMinHeight(dp(54));
