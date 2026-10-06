@@ -42,7 +42,10 @@ export function friendlyError(code) {
     secure_keyguard_present: '手机有密码锁，请先在手机上解锁。',
     unauthorized: '控制密钥不正确或已失效，请重新读取自己的 operator.token。',
     codec_unsupported: '这个浏览器无法解码手机画面，请使用支持 WebCodecs 的新版本浏览器。',
-    stream_capture_failed: '手机没能启动投屏，请检查 Root 权限和手机伙伴的状态。',
+    stream_root_denied: '手机伙伴没拿到 Root：请在 Root 管理器里给「AI 手机伙伴」永久授权，再重新连接。',
+    stream_server_failed: '手机上的投屏组件（scrcpy）没能启动，这台手机的系统可能不兼容。',
+    stream_connect_timeout: '投屏组件已启动，但 10 秒内没连上手机伙伴，请重新连接。',
+    stream_capture_failed: '投屏中途出错了，请重新连接；反复出现请看教程里的常见问题。',
     root_disabled: '手机还没有开启 Root 扩展。',
     stream_timeout: '连接超时，已经停止本次控制。',
   })[code] || `暂时没能接上手机${code ? `（${code}）` : ''}。`;
@@ -95,7 +98,7 @@ export class PhoneViewer {
         body: '{}', signal: abort.signal, cache: 'no-store',
       });
       const result = await response.json();
-      if (!response.ok || !result.ok) { this.fail(friendlyError(result.error || 'stream_capture_failed')); return; }
+      if (!response.ok || !result.ok) { this.fail(friendlyError(result.error || '')); return; }
       this.session = result.session;
       // A navigation may finish before the POST. Keep its id so stop can delete it.
       if (this.closed) return;
