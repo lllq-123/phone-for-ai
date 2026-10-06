@@ -164,6 +164,29 @@ def test_slow_stream_delete_keeps_command_queue_reserved(tmp_path):
     asyncio.run(scenario())
 
 
+def test_cancelled_finish_releases_stream_and_keeps_cancellation(tmp_path):
+    async def scenario():
+        relay=StreamRelay(BridgeService(tmp_path,"operator"))
+        started=asyncio.Event()
+
+        class StuckPeer:
+            async def send(self, value):
+                started.set()
+                await asyncio.Event().wait()
+            async def close(self, code=1000): pass
+
+        session=Session("b"*32,"device","viewer",viewer=StuckPeer())
+        relay.session=session
+        finish=asyncio.create_task(relay.finish(session,"stream_timeout"))
+        await started.wait()
+        finish.cancel("stop requested")
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await finish
+        assert cancelled.value.args==("stop requested",)
+        assert relay.session is None and session.finished.is_set()
+    asyncio.run(scenario())
+
+
 def test_files_write_is_redacted_for_operator_but_complete_for_device(tmp_path):
     service=BridgeService(tmp_path,"operator")
     client=TestClient(create_app(service))

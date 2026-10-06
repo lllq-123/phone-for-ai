@@ -23,7 +23,7 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: gradle/actions/setup-gradle@v4
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - name: Build debug APK
         working-directory: android
         run: ./gradlew --no-daemon testDebugUnitTest assembleDebug

@@ -35,7 +35,7 @@ class Peer:
     async def close(self, code: int = 1000) -> None:
         try:
             async with self.lock: await asyncio.wait_for(self.socket.close(code=code), SEND_TIMEOUT)
-        except BaseException: pass
+        except Exception: pass
 
 @dataclass
 class Session:
@@ -74,12 +74,18 @@ class StreamRelay:
             try:
                 if error: await p.send({"type":"error","error":error})
                 await p.send({"type":"stopped"})
-            except BaseException: pass
+            except Exception: pass
             await p.close(1011 if error else 1000)
-        await asyncio.gather(*(stop(p) for p in (s.viewer, s.device) if p), return_exceptions=True)
-        if self.session is s: self.session = None
-        self.service._notify()
-        s.finished.set()
+        # If the caller is cancelled mid-stop, still release the session, and let
+        # the cancellation propagate unchanged so the server can tell it was its own.
+        try:
+            async with asyncio.TaskGroup() as peers:
+                for p in (s.viewer, s.device):
+                    if p: peers.create_task(stop(p))
+        finally:
+            if self.session is s: self.session = None
+            self.service._notify()
+            s.finished.set()
     def operator(self, r: Request) -> bool:
         a = r.headers.get("authorization", "")
         return a.startswith("Bearer ") and self.service.operator_authorized(a[7:].strip())
