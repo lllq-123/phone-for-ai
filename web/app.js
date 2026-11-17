@@ -5,10 +5,12 @@ const base = '/api/phone';
 let token = '', viewer = null, stopping = Promise.resolve(), busy = false;
 let snapshotUrl = null, pendingCapture = null, operation = 0;
 
-function setState(phase, message) {
+function setState(phase, message, controlActive = null) {
   const live = phase === 'live';
   $('status-badge').dataset.phase = phase;
-  $('status-badge').querySelector('span').textContent = ({ idle:'等待连接',connecting:'连接中',waiting:'等待画面',live:'实时连接',paused:'已暂停',snapshot:'单张截图',error:'暂未连接' })[phase] || phase;
+  $('status-badge').querySelector('span').textContent = typeof controlActive === 'boolean' && ['waiting','live'].includes(phase)
+    ? (controlActive ? '已接管' : '正在旁观')
+    : ({ idle:'等待连接',connecting:'连接中',waiting:'等待画面',live:'等待画面',paused:'已暂停',snapshot:'单张截图',error:'暂未连接' })[phase] || phase;
   $('status-message').textContent = message;
   $('screen').hidden = !live;
   $('empty-screen').hidden = live || phase === 'snapshot';
@@ -65,7 +67,7 @@ $('connect-form').addEventListener('submit', async event => {
     if (ticket !== operation || document.hidden) return;
     const current = new PhoneViewer({
       canvas:$('screen'),base,token,
-      update:(phase,message) => { if (viewer === current) setState(phase,message); },
+      update:(phase,message,controlActive) => { if (viewer === current) setState(phase,message,controlActive); },
       resized:({w,h}) => { $('phone-shell').style.aspectRatio = `${w}/${h}`; },
       failure:message => {
         if (viewer !== current) return;
@@ -122,7 +124,7 @@ $('snapshot').addEventListener('click', async () => {
     $('snapshot-image').src = snapshotUrl; $('snapshot-image').hidden = false;
     const w = command.result?.image_width, h = command.result?.image_height;
     if (w && h) $('phone-shell').style.aspectRatio = `${w}/${h}`;
-    setState('snapshot','这是单张截图。连接实时画面后，就能直接点按手机。');
+    setState('snapshot','这是单张截图。连接实时画面后先旁观，点按或输入时自动接管。');
   } catch (error) { setState('error',error.message); }
   finally { busy = false; $('connect').disabled = !!viewer; $('snapshot').disabled = false; $('disconnect').disabled = !viewer; }
 });
@@ -158,13 +160,13 @@ $('text-form').addEventListener('submit',event => {
   event.preventDefault();
   if (viewer?.text($('phone-text').value)) {
     $('phone-text').value = ''; $('text-count').textContent = '0 / 2000'; $('send-text').disabled = true;
-    $('status-message').textContent = '文字已递给手机，请看输入框确认；尚未点击发送。';
+    $('status-message').textContent = '文字已提交，等待手机接收；接管以手机确认为准。';
   }
 });
 function leave() {
   ++operation;
   void stop();
-  setState('paused','离开页面后已停止控制。回来时点连接即可继续。');
+  setState('paused','离开页面后已停止连接。回来时重新连接，仍先旁观。');
 }
 document.addEventListener('visibilitychange',() => { if (document.hidden) leave(); });
 window.addEventListener('pagehide',leave);

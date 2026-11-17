@@ -16,6 +16,7 @@ import java.util.regex.Pattern;
 /** Explicitly enabled Root shell, file, and package operations. */
 final class DeviceCommandWorker {
     interface ProbeCallback { void done(boolean available, String detail); }
+    interface LaunchCallback { void done(boolean ok); }
     private static final Pattern ID = Pattern.compile("^[A-Za-z0-9_-]{1,128}$");
     private static final int MAX_BYTES = 49152;
     private static final long MAX_OFFSET = 9007199254740991L;
@@ -28,6 +29,26 @@ final class DeviceCommandWorker {
                 || "files.write".equals(type) || "apps.list".equals(type);
     }
     static boolean isBusy() { return BUSY.get(); }
+
+    /** Product-managed launches can be invalidated while queued and drained while running. */
+    static void launchApp(String packageName, LaunchCallback callback) {
+        long token=ScreenStreamClient.UI_BARRIER.token();
+        EXECUTOR.execute(() -> {
+            if(!ScreenStreamClient.UI_BARRIER.begin(token)){callback.done(false);return;}
+            boolean ok=false;
+            try{
+                BoundedProcessRunner.Result result=run("exec /system/bin/am start -W"
+                        +" -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p "+quote(packageName),
+                        true,null,8,8192,true);
+                String output=new String(result.stdout,StandardCharsets.UTF_8);
+                ok=succeeded(result) && !output.contains("Error:") && !output.contains("Exception")
+                        && !output.contains("Status: timeout");
+            }catch(Exception error){
+                if(error instanceof InterruptedException)Thread.currentThread().interrupt();
+            }finally{ScreenStreamClient.UI_BARRIER.end();}
+            callback.done(ok);
+        });
+    }
 
     static void probeRoot(Context context, ProbeCallback callback) {
         Context app = context.getApplicationContext();
@@ -46,7 +67,7 @@ final class DeviceCommandWorker {
         Context app = context.getApplicationContext();
         String id = command.optString("id", "");
         if (!ID.matcher(id).matches()) return;
-        if (ScreenStreamClient.isActive()) {
+        if (ScreenStreamClient.isControlActive() && PhoneCommandPolicy.mutates(command.optString("type", ""))) {
             BridgeClient.postFailure(app, id, "phone_stream_in_use");
             return;
         }
@@ -59,11 +80,17 @@ final class DeviceCommandWorker {
             return;
         }
         String serialized = command.toString();
+        long token = ScreenStreamClient.UI_BARRIER.token();
         EXECUTOR.execute(() -> {
             try {
                 JSONObject copy = new JSONObject(serialized);
                 JSONObject args = copy.optJSONObject("args");
                 if (args == null) throw new IllegalArgumentException();
+                if (PhoneCommandPolicy.mutates(copy.optString("type", ""))
+                        && !ScreenStreamClient.UI_BARRIER.permits(token)) {
+                    BridgeClient.postFailure(app, id, "screen_control_taken");
+                    return;
+                }
                 execute(app, id, copy.optString("type", ""), args);
             } catch (IllegalArgumentException error) {
                 BridgeClient.postFailure(app, id, "invalid_command_args");

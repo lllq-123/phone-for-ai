@@ -37,6 +37,10 @@ export function friendlyError(code) {
     device_not_paired: '还没有可连接的手机，请先完成配对。',
     device_capability_missing: '手机还没开启这项能力；实时画面需要无障碍和 Root 扩展。',
     stream_unsupported: '手机尚未开启实时投屏能力。',
+    observe_server_unsupported: '服务端不支持安全旁观，请先升级 server 到 v0.2.0 或更新版本，再重新连接。',
+    screen_stream_observe_unsupported: '手机伙伴不支持旁观模式，请先升级手机伙伴，再重新连接。',
+    control_takeover_timeout: '手机未及时确认接管，本次连接已停止，请重新连接后再试。',
+    control_takeover_failed: '手机未能完成接管，本次连接已停止，请检查手机伙伴后重试。',
     command_queue_busy: '手机还有一个操作没完成，稍后再连接。',
     command_pending: '手机还有一个操作没完成，稍后再连接。',
     secure_keyguard_present: '手机有密码锁，请先在手机上解锁。',
@@ -47,7 +51,7 @@ export function friendlyError(code) {
     stream_connect_timeout: '投屏组件已启动，但 10 秒内没连上手机伙伴，请重新连接。',
     stream_capture_failed: '投屏中途出错了，请重新连接；反复出现请看教程里的常见问题。',
     root_disabled: '手机还没有开启 Root 扩展。',
-    stream_timeout: '连接超时，已经停止本次控制。',
+    stream_timeout: '连接超时，已经停止本次连接。',
   })[code] || `暂时没能接上手机${code ? `（${code}）` : ''}。`;
 }
 
@@ -61,6 +65,8 @@ export class PhoneViewer {
     this.cleanup = null;
     this.socket = null;
     this.authenticated = false;
+    // Only a server status, sent after the phone ACK, can confirm takeover.
+    this.controlActive = null;
     this.keepalive = null;
     this.lastMessage = Date.now();
     this.decoder = null;
@@ -95,10 +101,13 @@ export class PhoneViewer {
     try {
       const response = await fetch(`${this.base}/stream`, {
         method: 'POST', headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
-        body: '{}', signal: abort.signal, cache: 'no-store',
+        body: JSON.stringify({ mode: 'observe' }), signal: abort.signal, cache: 'no-store',
       });
       const result = await response.json();
-      if (!response.ok || !result.ok) { this.fail(friendlyError(result.error || '')); return; }
+      if (!response.ok || !result.ok) {
+        this.fail(friendlyError(result.error === 'invalid_payload' ? 'observe_server_unsupported' : result.error || ''));
+        return;
+      }
       this.session = result.session;
       // A navigation may finish before the POST. Keep its id so stop can delete it.
       if (this.closed) return;
@@ -119,9 +128,9 @@ export class PhoneViewer {
           else if (event.data instanceof ArrayBuffer && this.authenticated) this.packet(event.data);
         } catch { this.fail('画面数据没能读出来，请重新连接。'); }
       };
-      socket.onerror = socket.onclose = () => this.fail('连接中断，本次控制已停止。');
+      socket.onerror = socket.onclose = () => this.fail('连接中断，本次连接已停止。');
       this.keepalive = setInterval(() => {
-        if (Date.now() - this.lastMessage > 30_000) this.fail('手机连接没有回应，本次控制已停止。');
+        if (Date.now() - this.lastMessage > 30_000) this.fail('手机连接没有回应，本次连接已停止。');
         else this.send({ type: 'ping' });
       }, 10_000);
     } catch { this.fail('暂时连不上服务，请检查地址、HTTPS 和网络。'); }
@@ -130,8 +139,15 @@ export class PhoneViewer {
 
   message(message) {
     if (message.type === 'status') {
+      if (typeof message.control_active !== 'boolean') {
+        this.fail(friendlyError('observe_server_unsupported'));
+        void this.stop();
+        return;
+      }
+      this.controlActive = message.control_active;
       this.authenticated = true;
-      if (!this.ready) this.update('waiting', message.state === 'connected' ? '手机连上了，等第一帧画面…' : '正在叫手机，待命时会慢一点…');
+      if (this.ready) this.liveStatus();
+      else this.update('waiting', message.state === 'connected' ? '手机连上了，等第一帧画面…' : '正在叫手机，待命时会慢一点…', this.controlActive);
     } else if (message.type === 'video') {
       if (message.codec !== 'h264') { this.fail(friendlyError('codec_unsupported')); return; }
       this.cancelTouches();
@@ -141,9 +157,15 @@ export class PhoneViewer {
         this.decoder.reset(); this.decoder.configure(this.decoderConfig);
       }
       this.canvas.getContext('2d', { alpha: false })?.clearRect(0, 0, this.canvas.width, this.canvas.height);
-      this.update('waiting', '正在接上画面…');
+      this.update('waiting', '正在接上画面…', this.controlActive);
     } else if (message.type === 'error') this.fail(friendlyError(message.error));
     else if (message.type === 'stopped') this.fail('本次连接已经结束。');
+  }
+
+  liveStatus() {
+    this.update('live', this.controlActive
+      ? '已接管。点按、滑动和长按会直接落在手机上；停止连接后，agent 可以继续。'
+      : '正在旁观，agent 可以继续操作。点按画面、导航键或输入文字时会自动接管。', this.controlActive);
   }
 
   send(message) {
@@ -180,7 +202,7 @@ export class PhoneViewer {
   async configure() {
     this.closeDecoder();
     if (!this.sps || this.sps.length < 4 || !this.pps) return;
-    this.update('waiting', '正在接上画面…');
+    this.update('waiting', '正在接上画面…', this.controlActive);
     const generation = this.generation;
     const config = {
       codec: 'avc1.' + Array.from(this.sps.subarray(1, 4), v => v.toString(16).padStart(2, '0')).join(''),
@@ -203,7 +225,7 @@ export class PhoneViewer {
               this.canvas.width = w; this.canvas.height = h; this.resized({ w, h });
             }
             context.drawImage(frame, 0, 0, w, h);
-            if (!this.ready) { this.ready = true; this.update('live', '已连接。点按、滑动和长按会直接落在手机上。'); }
+            if (!this.ready) { this.ready = true; this.liveStatus(); }
           } catch { this.fail('画面暂时没能显示出来。'); }
           finally { frame.close(); }
         },
@@ -233,7 +255,7 @@ export class PhoneViewer {
     if (decoder.decodeQueueSize > MAX_QUEUE) {
       if (!key || !this.decoderConfig || !this.sps || !this.pps) { void this.configure(); return; }
       this.cancelTouches(); this.ready = false; this.needKeyframe = true;
-      this.update('waiting', '网络有点慢，正在接回画面…');
+      this.update('waiting', '网络有点慢，正在接回画面…', this.controlActive);
       try { decoder.reset(); decoder.configure(this.decoderConfig); }
       catch { void this.configure(); return; }
     }

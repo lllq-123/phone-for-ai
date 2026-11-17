@@ -228,7 +228,7 @@ def create_app(service: BridgeService | None = None) -> Starlette:
 
     from .stream import StreamRelay
     relay = StreamRelay(service)
-    service.stream_active = relay.is_active
+    service.stream_active = relay.is_control_active
     routes = [*ROUTES, *relay.routes()]
     packaged_web = Path(__file__).with_name("web")
     source_web = Path(__file__).resolve().parents[2] / "web"

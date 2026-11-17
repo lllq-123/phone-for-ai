@@ -27,23 +27,27 @@ def test_operator_and_device_auth_are_isolated(tmp_path):
     assert "token" not in str(status).lower()
 
 
-def test_stream_first_frame_auth_relay_and_command_exclusion(tmp_path):
+def test_stream_first_frame_auth_and_observation_allows_commands(tmp_path):
     service=BridgeService(tmp_path,"operator")
     client=TestClient(create_app(service))
     enrollment=client.post("/api/phone/enrollment",headers=auth("operator"),json={"ttl_seconds":60}).json()
-    device=client.post("/api/phone/enroll",json={"enrollment_code":enrollment["enrollment_code"],"app_version":"1","capabilities":{"screen_stream":True,"screen_capture":True}}).json()
-    client.post("/api/phone/heartbeat",headers=auth(device["device_token"]),json={"app_version":"1","capabilities":{"screen_stream":True,"screen_capture":True},"status":{},"long_poll_seconds":0})
+    capabilities={"screen_stream":True,"screen_stream_observe":True,"screen_capture":True}
+    device=client.post("/api/phone/enroll",json={"enrollment_code":enrollment["enrollment_code"] ,"app_version":"1","capabilities":capabilities}).json()
+    client.post("/api/phone/heartbeat",headers=auth(device["device_token"]),json={"app_version":"1","capabilities":capabilities,"status":{},"long_poll_seconds":0})
     created=client.post("/api/phone/stream",headers=auth("operator"),json={}).json()
     session=created["session"]
     status=client.get("/api/phone/stream",headers=auth("operator")).json()
     assert "viewer_token" not in str(status)
     with client.websocket_connect(session["viewer_path"]) as viewer:
         viewer.send_json({"type":"auth","token":session["viewer_token"]})
-        assert viewer.receive_json()=={"type":"status","state":"waiting"}
-        busy=client.post("/api/phone/commands",headers=auth("operator"),json={"type":"screen.capture","args":{}})
-        assert busy.status_code==409 and busy.json()["error"]=="phone_stream_in_use"
-        heartbeat=client.post("/api/phone/heartbeat",headers=auth(device["device_token"]),json={"app_version":"1","capabilities":{"screen_stream":True,"screen_capture":True},"status":{},"long_poll_seconds":0}).json()
+        assert viewer.receive_json()=={"type":"status","state":"waiting","control_active":False}
+        queued=client.post("/api/phone/commands",headers=auth("operator"),json={"type":"screen.capture","args":{}})
+        assert queued.status_code==201
+        heartbeat=client.post("/api/phone/heartbeat",headers=auth(device["device_token"]),json={"app_version":"1","capabilities":capabilities,"status":{},"long_poll_seconds":0}).json()
+        assert heartbeat["command"]["id"]==queued.json()["command"]["id"]
         assert heartbeat["stream"]["device_path"].endswith("/device")
+        assert heartbeat["stream"]["mode"]=="observe"
+        assert client.get("/api/phone/stream",headers=auth("operator")).json()["control_active"] is False
         viewer.send_json({"type":"ping"})
         assert viewer.receive_json()=={"type":"pong"}
 
@@ -86,8 +90,8 @@ def test_lifespan_stops_unattached_stream(tmp_path):
     app=create_app(service)
     with TestClient(app) as client:
         enrollment=client.post("/api/phone/enrollment",headers=auth("operator"),json={"ttl_seconds":60}).json()
-        device=client.post("/api/phone/enroll",json={"enrollment_code":enrollment["enrollment_code"],"app_version":"1","capabilities":{"screen_stream":True}}).json()
-        client.post("/api/phone/heartbeat",headers=auth(device["device_token"]),json={"app_version":"1","capabilities":{"screen_stream":True},"status":{},"long_poll_seconds":0})
+        device=client.post("/api/phone/enroll",json={"enrollment_code":enrollment["enrollment_code"],"app_version":"1","capabilities":{"screen_stream":True,"screen_stream_observe":True}}).json()
+        client.post("/api/phone/heartbeat",headers=auth(device["device_token"]),json={"app_version":"1","capabilities":{"screen_stream":True,"screen_stream_observe":True},"status":{},"long_poll_seconds":0})
         assert client.post("/api/phone/stream",headers=auth("operator"),json={}).status_code==201
         assert app.state.stream.session is not None
     assert app.state.stream.session is None
@@ -98,16 +102,16 @@ def test_new_enrollment_closes_old_viewer_and_device(tmp_path):
     app=create_app(service)
     with TestClient(app) as client:
         first=client.post("/api/phone/enrollment",headers=auth("operator"),json={"ttl_seconds":60}).json()
-        device=client.post("/api/phone/enroll",json={"enrollment_code":first["enrollment_code"],"app_version":"1","capabilities":{"screen_stream":True}}).json()
-        client.post("/api/phone/heartbeat",headers=auth(device["device_token"]),json={"app_version":"1","capabilities":{"screen_stream":True},"status":{},"long_poll_seconds":0})
+        device=client.post("/api/phone/enroll",json={"enrollment_code":first["enrollment_code"],"app_version":"1","capabilities":{"screen_stream":True,"screen_stream_observe":True}}).json()
+        client.post("/api/phone/heartbeat",headers=auth(device["device_token"]),json={"app_version":"1","capabilities":{"screen_stream":True,"screen_stream_observe":True},"status":{},"long_poll_seconds":0})
         stream=client.post("/api/phone/stream",headers=auth("operator"),json={}).json()["session"]
         with client.websocket_connect(stream["viewer_path"]) as viewer:
             viewer.send_json({"type":"auth","token":stream["viewer_token"]})
-            assert viewer.receive_json()=={"type":"status","state":"waiting"}
-            desired=client.post("/api/phone/heartbeat",headers=auth(device["device_token"]),json={"app_version":"1","capabilities":{"screen_stream":True},"status":{},"long_poll_seconds":0}).json()["stream"]
+            assert viewer.receive_json()=={"type":"status","state":"waiting","control_active":False}
+            desired=client.post("/api/phone/heartbeat",headers=auth(device["device_token"]),json={"app_version":"1","capabilities":{"screen_stream":True,"screen_stream_observe":True},"status":{},"long_poll_seconds":0}).json()["stream"]
             with client.websocket_connect(desired["device_path"]) as phone:
                 phone.send_json({"type":"auth","token":device["device_token"]})
-                assert viewer.receive_json()=={"type":"status","state":"connected"}
+                assert viewer.receive_json()=={"type":"status","state":"connected","control_active":False}
                 replacement=client.post("/api/phone/enrollment",headers=auth("operator"),json={"ttl_seconds":60})
                 assert replacement.status_code==201
                 assert viewer.receive_json()=={"type":"error","error":"pairing_revoked"}
@@ -122,9 +126,9 @@ def test_slow_stream_delete_keeps_command_queue_reserved(tmp_path):
     async def scenario():
         service=BridgeService(tmp_path,"operator")
         code=service.create_enrollment(60)["enrollment_code"]
-        device=service.enroll(code,"1",{"screen_stream":True,"screen_capture":True})
-        service.heartbeat(device["device_token"],{"app_version":"1","capabilities":{"screen_stream":True,"screen_capture":True},"status":{}})
-        relay=StreamRelay(service); service.stream_active=relay.is_active
+        device=service.enroll(code,"1",{"screen_stream":True,"screen_stream_observe":True,"wake_screen":True})
+        service.heartbeat(device["device_token"],{"app_version":"1","capabilities":{"screen_stream":True,"screen_stream_observe":True,"wake_screen":True},"status":{}})
+        relay=StreamRelay(service); service.stream_active=relay.is_control_active
         started=asyncio.Event(); release=asyncio.Event()
 
         class SlowPeer:
@@ -135,6 +139,7 @@ def test_slow_stream_delete_keeps_command_queue_reserved(tmp_path):
 
         session=Session("a"*32,device["device_id"],"viewer",viewer_seen=__import__("time").monotonic(),viewer=SlowPeer())
         relay.session=session
+        relay.mark_control(session)
         app=SimpleNamespace(state=SimpleNamespace(bridge=service,stream=relay))
         delete_request=Request({
             "type":"http","method":"DELETE","path":"/api/phone/stream/"+session.id,
@@ -142,7 +147,7 @@ def test_slow_stream_delete_keeps_command_queue_reserved(tmp_path):
         })
         delete_task=asyncio.create_task(relay.delete(delete_request))
         await started.wait()
-        body=b'{"type":"screen.capture","args":{}}'
+        body=b'{"type":"screen.wake","args":{}}'
         sent=False
         async def receive():
             nonlocal sent
@@ -167,6 +172,7 @@ def test_slow_stream_delete_keeps_command_queue_reserved(tmp_path):
 def test_cancelled_finish_releases_stream_and_keeps_cancellation(tmp_path):
     async def scenario():
         relay=StreamRelay(BridgeService(tmp_path,"operator"))
+        relay.service.stream_active=relay.is_control_active
         started=asyncio.Event()
 
         class StuckPeer:
@@ -177,6 +183,7 @@ def test_cancelled_finish_releases_stream_and_keeps_cancellation(tmp_path):
 
         session=Session("b"*32,"device","viewer",viewer=StuckPeer())
         relay.session=session
+        relay.mark_control(session)
         finish=asyncio.create_task(relay.finish(session,"stream_timeout"))
         await started.wait()
         finish.cancel("stop requested")
@@ -184,6 +191,7 @@ def test_cancelled_finish_releases_stream_and_keeps_cancellation(tmp_path):
             await finish
         assert cancelled.value.args==("stop requested",)
         assert relay.session is None and session.finished.is_set()
+        assert relay.is_control_active() is False
     asyncio.run(scenario())
 
 

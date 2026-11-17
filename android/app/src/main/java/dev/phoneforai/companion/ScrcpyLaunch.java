@@ -13,11 +13,15 @@ final class ScrcpyLaunch {
     }
 
     static String serverCommand(String pidPath, String jarPath, String scid) {
+        return serverCommand(pidPath, jarPath, scid, false);
+    }
+
+    static String serverCommand(String pidPath, String jarPath, String scid, boolean observe) {
         return "umask 077; echo $$ > " + quote(pidPath)
                 + " && CLASSPATH=" + quote(jarPath)
                 + " exec /system/bin/app_process / com.genymobile.scrcpy.Server " + VERSION
                 + " scid=" + scid + " tunnel_forward=false audio=false control=true clipboard_autosync=false"
-                + " cleanup=false power_on=true stay_awake=false max_size=1280 video_bit_rate=1500000 max_fps=30"
+                + " cleanup=false power_on=" + !observe + " stay_awake=false max_size=1280 video_bit_rate=1500000 max_fps=30"
                 + " video_codec=h264 send_device_meta=false send_frame_meta=true send_stream_meta=true";
     }
 

@@ -215,7 +215,7 @@ final class BridgeClient {
                 .put("wake_screen", access).put("gestures", access).put("text_input", access)
                 .put("launch", access).put("ui_tree", access).put("clipboard", access)
                 .put("root_shell", root).put("file_access", root).put("app_inventory", root)
-                .put("screen_stream", root);
+                .put("screen_stream", root).put("screen_stream_observe", root);
     }
 
     private static JSONObject deviceStatus(Context context) throws Exception {

@@ -6,6 +6,8 @@ import android.content.Intent;
 import android.net.LocalServerSocket;
 import android.net.LocalSocket;
 import android.os.PowerManager;
+import android.os.Handler;
+import android.os.Looper;
 import android.system.Os;
 import android.system.OsConstants;
 import android.util.Log;
@@ -26,10 +28,13 @@ final class ScreenStreamClient extends WebSocketListener {
             .connectTimeout(15, TimeUnit.SECONDS).readTimeout(0, TimeUnit.SECONDS)
             .pingInterval(10, TimeUnit.SECONDS).build();
     private static ScreenStreamClient current;
+    static final AutomationUiBarrier UI_BARRIER = new AutomationUiBarrier();
     private final Context context;
     private final String id, token;
     private final File pidFile;
     private final AtomicBoolean stopped = new AtomicBoolean(false);
+    private final ScreenStreamControlPolicy ownership;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private volatile WebSocket ws;
     private volatile LocalSocket video, control;
     private final AtomicReference<LocalServerSocket> listener=new AtomicReference<>();
@@ -43,12 +48,19 @@ final class ScreenStreamClient extends WebSocketListener {
     private volatile PowerManager.WakeLock wakeLock;
     private volatile long lastServerPing = android.os.SystemClock.elapsedRealtime();
     private int width, height;
+    private long controlRequestedAt;
+    private ScreenWakeCoordinator controlWake;
+    private boolean controlWakeReady;
 
-    private ScreenStreamClient(Context context, String id, String token) {
+    private ScreenStreamClient(Context context, String id, String token, boolean observe) {
         this.context = context.getApplicationContext(); this.id=id; this.token=token;
+        ownership = new ScreenStreamControlPolicy(observe);
         this.pidFile = new File(this.context.getFilesDir(), "screen-stream-"+id+".pid");
     }
     static synchronized boolean isActive() { return current != null && !current.stopped.get(); }
+    static synchronized boolean isControlActive() {
+        return current != null && !current.stopped.get() && current.ownership.isControlActive();
+    }
     static synchronized String currentId() { return isActive() ? current.id : ""; }
     static synchronized void stopAll() { if (current != null) current.stop(); current = null; }
     static synchronized void sync(Context context, JSONObject desired, String token, String baseUrl) {
@@ -60,7 +72,7 @@ final class ScreenStreamClient extends WebSocketListener {
         String path = desired.optString("device_path", "");
         String socketUrl = socketUrl(baseUrl, path, id);
         if (socketUrl == null) return;
-        current = new ScreenStreamClient(context,id,token);
+        current = new ScreenStreamClient(context,id,token,"observe".equals(desired.optString("mode", "")));
         current.ws = HTTP.newWebSocket(new Request.Builder().url(socketUrl).build(), current);
     }
     private static String socketUrl(String baseUrl, String path, String id) {
@@ -85,9 +97,11 @@ final class ScreenStreamClient extends WebSocketListener {
             lastServerPing=android.os.SystemClock.elapsedRealtime();
             if ("ping".equals(type)) { socket.send("{\"type\":\"pong\"}"); return; }
             if ("status".equals(type) || "pong".equals(type)) return;
+            if ("take_control".equals(type)) { mainHandler.post(this::takeControl); return; }
             synchronized(this) {
                 DataOutputStream out=controls;
                 if (stopped.get() || out==null) return;
+                if (!"reset_video".equals(type) && !ownership.acceptsInput()) return;
                 if ("touch".equals(type)) {
                     int action=m.getInt("action"), x=m.getInt("x"), y=m.getInt("y");
                     int w=m.getInt("width"),h=m.getInt("height"),pointer=m.getInt("pointer_id");
@@ -102,7 +116,7 @@ final class ScreenStreamClient extends WebSocketListener {
                     if(code!=3 && code!=4 && code!=187 && code!=24 && code!=25 && code!=66 && code!=67) return;
                     for(int a=0;a<=1;a++){out.writeByte(0);out.writeByte(a);out.writeInt(code);out.writeInt(0);out.writeInt(0);}
                 } else if ("text".equals(type)) {
-                    String value=m.getString("text");if(value.length()>2000)return;
+                    String value=m.getString("text");if(value.isEmpty() || value.length()>2000)return;
                     byte[] utf8=value.getBytes(StandardCharsets.UTF_8);
                     out.writeByte(9);out.writeLong(0);out.writeByte(1);out.writeInt(utf8.length);out.write(utf8);
                 } else if ("reset_video".equals(type)) { out.writeByte(17); }
@@ -121,14 +135,16 @@ final class ScreenStreamClient extends WebSocketListener {
             if(keyguard==null || (keyguard.isKeyguardLocked() && keyguard.isDeviceSecure())) {
                 fail("secure_keyguard_present");return;
             }
-            if(!BridgeClient.rootAvailable(context) || PhoneAccessibilityService.isCommandBusy()
-                    || DeviceCommandWorker.isBusy()){fail("phone_action_in_progress");return;}
-            PowerManager pm=(PowerManager)context.getSystemService(Context.POWER_SERVICE);
-            PowerManager.WakeLock lock=pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP,
-                    "phoneforai:interactive-stream");
-            synchronized(this){if(stopped.get())return;wakeLock=lock;lock.acquire(4*60*60*1000L);}
-            if(keyguard.isKeyguardLocked()) {
-                context.startActivity(new Intent(context,WakeActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            if(!BridgeClient.rootAvailable(context) || !ownership.observe
+                    && (PhoneAccessibilityService.isCommandBusy() || DeviceCommandWorker.isBusy())) {
+                fail("phone_action_in_progress");return;
+            }
+            if (!ownership.observe) acquireControlWakeLock();
+            if(!ownership.observe && keyguard.isKeyguardLocked()) {
+                WakeActivity.allowWake();
+                Intent wake=WakeActivity.prepare(new Intent(context,WakeActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                try { context.startActivity(wake); }
+                catch (RuntimeException error) { WakeActivity.cancelLaunch(wake); throw error; }
                 long deadline=android.os.SystemClock.elapsedRealtime()+5000;
                 while(keyguard.isKeyguardLocked() && !stopped.get() && android.os.SystemClock.elapsedRealtime()<deadline) Thread.sleep(100);
                 if(keyguard.isKeyguardLocked()){fail("wake_timeout");return;}
@@ -141,7 +157,7 @@ final class ScreenStreamClient extends WebSocketListener {
                 if(!server.setReadOnly())throw new IOException("read_only_server_failed");
             }
             String scid=id.substring(0,7); // positive 28-bit id, represented as hexadecimal
-            String command=ScrcpyLaunch.serverCommand(pidFile.getAbsolutePath(),server.getAbsolutePath(),scid);
+            String command=ScrcpyLaunch.serverCommand(pidFile.getAbsolutePath(),server.getAbsolutePath(),scid,ownership.observe);
             // scrcpy connects once per socket without retrying, so listen before launching it.
             LocalServerSocket accepting=new LocalServerSocket(ScrcpyLaunch.socketName(scid));
             long deadline=android.os.SystemClock.elapsedRealtime()+10000;
@@ -233,12 +249,73 @@ final class ScreenStreamClient extends WebSocketListener {
         }
     }
     private void send(String text){WebSocket s=ws;if(s!=null&&!stopped.get())s.send(text);}
+    private void takeControl() {
+        if (stopped.get()) return;
+        if (controls == null) { fail("control_takeover_failed"); return; }
+        try {
+            if (controlRequestedAt == 0L) controlRequestedAt = android.os.SystemClock.elapsedRealtime();
+            if (!ownership.takeControl(() -> {
+                UI_BARRIER.takeControl();
+                PhoneAccessibilityService.cancelForScreenControl();
+                WakeActivity.suppressWake();
+                acquireControlWakeLock();
+            }, this::controlUiReady)) {
+                if (stopped.get()) return;
+                if (android.os.SystemClock.elapsedRealtime()-controlRequestedAt >= 6000L) {
+                    fail("control_takeover_timeout");
+                } else mainHandler.postDelayed(this::takeControl,25L);
+                return;
+            }
+            send("{\"type\":\"control_ready\"}");
+        } catch (RuntimeException error) { fail("control_takeover_failed"); }
+    }
+    private boolean controlUiReady() {
+        PhoneAccessibilityService.settleManagedLaunches();
+        if (!PhoneAccessibilityService.gesturesIdle() || !UI_BARRIER.idle()) return false;
+        if (controlWakeReady) return WakeActivity.controlReady();
+        if (controlWake != null || !WakeActivity.controlReady()) return false;
+        KeyguardManager keyguard=(KeyguardManager)context.getSystemService(Context.KEYGUARD_SERVICE);
+        PowerManager power=(PowerManager)context.getSystemService(Context.POWER_SERVICE);
+        android.hardware.display.DisplayManager displays=(android.hardware.display.DisplayManager)
+                context.getSystemService(Context.DISPLAY_SERVICE);
+        android.view.Display display=displays==null?null:displays.getDisplay(android.view.Display.DEFAULT_DISPLAY);
+        if (keyguard!=null && power!=null && power.isInteractive() && !keyguard.isKeyguardLocked()
+                && display!=null && display.getState()==android.view.Display.STATE_ON) {
+            controlWakeReady=true; return true;
+        }
+        controlWake=PhoneAccessibilityService.controlWake(
+                () -> !stopped.get() && ownership.isControlActive(), new ScreenWakeCoordinator.Callback() {
+            @Override public void ready() { WakeActivity.suppressWake(); controlWakeReady=true; }
+            @Override public void failed(String reason) { fail("control_takeover_failed"); }
+        });
+        if (controlWake!=null) controlWake.start();
+        return false;
+    }
+    private synchronized void acquireControlWakeLock() {
+        if (stopped.get() || wakeLock!=null) return;
+        PowerManager pm=(PowerManager)context.getSystemService(Context.POWER_SERVICE);
+        if (pm==null) throw new IllegalStateException("power_service_missing");
+        PowerManager.WakeLock lock=pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "phoneforai:interactive-stream");
+        lock.acquire(4*60*60*1000L); wakeLock=lock;
+    }
     private void fail(String error){
         try{send(new JSONObject().put("type","error").put("error",error).toString());}catch(Exception ignored){}
         stop();
     }
     private synchronized void stop(){
         if(!stopped.compareAndSet(false,true))return;
+        ScreenWakeCoordinator waking=controlWake;
+        if(waking!=null)waking.cancel();
+        if(ownership.isControlActive()) UI_BARRIER.releaseControl();
+        ownership.stop();
+        mainHandler.removeCallbacksAndMessages(null);
+        if(waking!=null)mainHandler.post(() -> {
+            synchronized(ScreenStreamClient.class) {
+                if((current==this || !isControlActive()) && !PhoneAccessibilityService.isCommandBusy())
+                    WakeActivity.suppressWake();
+            }
+        });
         close(video);close(control);closeListener();controls=null;
         WebSocket socket=ws;if(socket!=null)socket.close(1000,"screen_closed");
         Process child=process;if(child!=null)new Thread(()->stopServer(child),"phone-screen-stop").start();

@@ -34,6 +34,17 @@ public final class ScrcpyLaunchTest {
     }
 
     @Test
+    public void observerKeepsReverseTransportWithoutPoweringOnTheScreen(){
+        String command=ScrcpyLaunch.serverCommand("/data/files/screen.pid","/data/files/server.jar","0123abc",true);
+        assertTrue(command.contains(" tunnel_forward=false "));
+        assertTrue(command.contains(" power_on=false "));
+        assertTrue(command.contains(" stay_awake=false "));
+        assertFalse(command.contains("power_on=true"));
+        assertFalse(command.contains("send_dummy_byte"));
+        assertTrue(command.startsWith("umask 077; echo $$ > '/data/files/screen.pid'"));
+    }
+
+    @Test
     public void serverCommandQuotesPathsForTheShell() {
         String command = ScrcpyLaunch.serverCommand("/data/it's.pid", "/data/o'k/server.jar", "0000001");
         assertTrue(command.startsWith("umask 077; echo $$ > '/data/it'\\''s.pid' && CLASSPATH='/data/o'\\''k/server.jar' exec "));

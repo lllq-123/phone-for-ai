@@ -48,6 +48,8 @@ UI_COMMANDS = {
     "ui.tap", "ui.long_press", "ui.swipe", "ui.type", "ui.global.back",
     "ui.global.home", "ui.global.recents",
 }
+READ_ONLY_COMMANDS = {"screen.capture", "ui.dump", "apps.list", "files.list", "files.read"}
+MUTATING_COMMANDS = frozenset(COMMAND_TYPES - READ_ONLY_COMMANDS)
 SCREENSHOT_COMMANDS = {
     "screen.capture", "screen.wake", "app.launch", *UI_COMMANDS,
 }
@@ -61,6 +63,7 @@ COMMAND_CAPABILITIES = {
 CAPABILITY_KEYS = {
     "accessibility", "screen_capture", "wake_screen", "gestures", "text_input",
     "launch", "ui_tree", "clipboard", "root_shell", "file_access", "app_inventory", "screen_stream",
+    "screen_stream_observe",
 }
 TERMINAL_STATES = {"completed", "failed", "cancelled", "expired"}
 
@@ -220,6 +223,9 @@ class BridgeService:
         self.lock = threading.RLock()
         self._generation = 0
         self._waiters: set[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = set()
+        # Injected by the API: this reports control ownership, not video viewing.
+        # The relay changes ownership under this same RLock, so queue admission
+        # and take_pending cannot race the first explicit viewer action.
         self.stream_active = lambda: False
         ensure_private_dir(self.state_dir)
         ensure_private_dir(self.artifact_dir)
@@ -476,7 +482,8 @@ class BridgeService:
             if not self._device_authorized(state, token):
                 raise BridgeError(401, "unauthorized")
             changed = self._expire(state, now)
-            command = next((c for c in state["commands"] if c.get("status") == "pending"), None)
+            command = next((c for c in state["commands"] if c.get("status") == "pending"
+                            and not self.stream_blocks_command(c.get("type"))), None)
             if command is not None:
                 command["status"] = "delivered"
                 command["delivered_at"] = now
@@ -484,6 +491,11 @@ class BridgeService:
             if changed:
                 self._write(state)
             return self._public_command(command, for_device=True) if command else None
+
+    def stream_blocks_command(self, command_type: str) -> bool:
+        """Control ownership excludes mutation; video observation excludes nothing."""
+        with self.lock:
+            return command_type in MUTATING_COMMANDS and self.stream_active()
 
     def queue_command(self, command_type: Any, args: Any, ttl_seconds: Any = DEFAULT_COMMAND_TTL_SECONDS) -> dict[str, Any]:
         command_type, clean_args = sanitize_command(command_type, args)
@@ -501,7 +513,7 @@ class BridgeService:
                 if changed:
                     self._write(state)
                 raise BridgeError(409, "command_busy")
-            if self.stream_active():
+            if self.stream_blocks_command(command_type):
                 raise BridgeError(409, "phone_stream_in_use")
             capability = COMMAND_CAPABILITIES.get(command_type, "gestures" if command_type in UI_COMMANDS else None)
             if capability and device.get("capabilities", {}).get(capability) is not True:

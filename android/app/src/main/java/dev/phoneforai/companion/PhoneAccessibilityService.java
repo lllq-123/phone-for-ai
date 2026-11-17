@@ -28,6 +28,8 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.util.regex.Pattern;
+import java.util.ArrayList;
+import java.util.function.BooleanSupplier;
 
 public final class PhoneAccessibilityService extends AccessibilityService {
     private static final Pattern ID = Pattern.compile("^[A-Za-z0-9_-]{1,128}$");
@@ -41,6 +43,11 @@ public final class PhoneAccessibilityService extends AccessibilityService {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean busy;
+    private boolean activeMutating;
+    private final Handler gestureCallbacks = new Handler(Looper.getMainLooper());
+    private int nativeGestures;
+    private long gestureGeneration;
+    private final ArrayList<ManagedIntentLaunchPolicy> managedLaunches = new ArrayList<>();
     private String activeId = "";
     private String foregroundPackage = "";
     private boolean basisValid;
@@ -56,6 +63,85 @@ public final class PhoneAccessibilityService extends AccessibilityService {
 
     static boolean isConnected() { return instance != null; }
     static boolean isCommandBusy() { PhoneAccessibilityService service = instance; return service != null && service.busy; }
+    static void cancelForScreenControl() {
+        PhoneAccessibilityService service=instance;
+        if (service==null) return;
+        service.gestureGeneration++;
+        service.basisValid=false;
+        if (service.busy && service.activeMutating) service.fail(service.activeId,"screen_control_taken");
+    }
+    static boolean gesturesIdle() { return instance==null || instance.nativeGestures==0; }
+    static void settleManagedLaunches() {
+        PhoneAccessibilityService service=instance;
+        if(service==null)return;
+        service.settleOwnManagedLaunches();
+    }
+    private void settleOwnManagedLaunches() {
+        String foreground=instance==this ? currentPackage() : "";
+        long now=SystemClock.elapsedRealtime();
+        managedLaunches.removeIf(launch -> {
+            if(!launch.finished(now,foreground))return false;
+            ScreenStreamClient.UI_BARRIER.end();
+            return true;
+        });
+    }
+    private boolean current(String id) { return busy && id.equals(activeId); }
+    static ScreenWakeCoordinator controlWake(BooleanSupplier current, ScreenWakeCoordinator.Callback callback) {
+        PhoneAccessibilityService service=instance;
+        if(service==null){callback.failed("accessibility_unavailable");return null;}
+        return new ScreenWakeCoordinator(new ScreenWakeCoordinator.Host() {
+            public long nowMs(){return SystemClock.elapsedRealtime();}
+            public boolean isCurrent(){return instance==service && current.getAsBoolean();}
+            public ScreenWakeCoordinator.State state(){
+                KeyguardManager keyguard=(KeyguardManager)service.getSystemService(KEYGUARD_SERVICE);
+                PowerManager power=(PowerManager)service.getSystemService(POWER_SERVICE);
+                android.hardware.display.DisplayManager displays=(android.hardware.display.DisplayManager)
+                        service.getSystemService(DISPLAY_SERVICE);
+                Display display=displays==null?null:displays.getDisplay(Display.DEFAULT_DISPLAY);
+                return new ScreenWakeCoordinator.State(keyguard!=null && power!=null && display!=null,
+                        power!=null && power.isInteractive(),display!=null && display.getState()==Display.STATE_ON,
+                        keyguard==null || keyguard.isKeyguardLocked(),keyguard!=null && keyguard.isDeviceSecure());
+            }
+            public boolean launchWakeActivity(){
+                WakeActivity.allowWake();
+                Intent intent=WakeActivity.prepare(new Intent(service,WakeActivity.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION
+                                | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS));
+                try{service.startActivity(intent);return true;}
+                catch(RuntimeException error){WakeActivity.cancelLaunch(intent);return false;}
+            }
+            public boolean dismissSwipe(Runnable completed,Runnable cancelled){
+                int width=service.getResources().getDisplayMetrics().widthPixels;
+                int height=service.getResources().getDisplayMetrics().heightPixels;
+                Path path=new Path();path.moveTo(width*.5f,height*.82f);path.lineTo(width*.5f,height*.22f);
+                GestureDescription gesture=new GestureDescription.Builder()
+                        .addStroke(new GestureDescription.StrokeDescription(path,0L,350L)).build();
+                return service.dispatchTrackedGesture(gesture,new GestureResultCallback(){
+                    @Override public void onCompleted(GestureDescription value){completed.run();}
+                    @Override public void onCancelled(GestureDescription value){cancelled.run();}
+                },true);
+            }
+            public void postDelayed(Runnable action,long delay){service.gestureCallbacks.postDelayed(action,delay);}
+            public void trace(String phase,ScreenWakeCoordinator.State state){}
+        },callback);
+    }
+    private boolean dispatchTrackedGesture(GestureDescription gesture, GestureResultCallback callback, boolean controlWake) {
+        if (!controlWake && ScreenStreamClient.isControlActive()) return false;
+        long generation=gestureGeneration;
+        nativeGestures++;
+        boolean accepted=dispatchGesture(gesture,new GestureResultCallback() {
+            private boolean finished;
+            private boolean complete() {
+                if(finished)return false;
+                finished=true; nativeGestures--;
+                return generation==gestureGeneration && (controlWake || !ScreenStreamClient.isControlActive());
+            }
+            @Override public void onCompleted(GestureDescription value) { if(complete())callback.onCompleted(value); }
+            @Override public void onCancelled(GestureDescription value) { if(complete())callback.onCancelled(value); }
+        },gestureCallbacks);
+        if(!accepted)nativeGestures--;
+        return accepted;
+    }
     static void requestScreenPowerStateSync() {
         PhoneAccessibilityService expected = instance;
         if (expected == null) return;
@@ -88,6 +174,7 @@ public final class PhoneAccessibilityService extends AccessibilityService {
         if (event != null && event.getPackageName() != null) {
             String value = event.getPackageName().toString();
             if (PACKAGE.matcher(value).matches()) foregroundPackage = value;
+            settleManagedLaunches();
         }
     }
     @Override public void onInterrupt() {
@@ -108,8 +195,11 @@ public final class PhoneAccessibilityService extends AccessibilityService {
         String type = command.optString("type", "");
         JSONObject args = command.optJSONObject("args");
         if (!ID.matcher(id).matches() || args == null) { fail(id, "invalid_command"); return; }
-        if (ScreenStreamClient.isActive()) { fail(id, "phone_stream_in_use"); return; }
+        if (ScreenStreamClient.isControlActive() && PhoneCommandPolicy.mutates(type)) {
+            fail(id, "phone_stream_in_use"); return;
+        }
         if (busy) { fail(id, "accessibility_busy"); return; }
+        activeMutating=PhoneCommandPolicy.mutates(type);
         ScreenshotOptions options;
         try { options = ScreenshotOptions.forCommand(type,
                 args.has("max_width") ? args.opt("max_width") : null,
@@ -170,8 +260,10 @@ public final class PhoneAccessibilityService extends AccessibilityService {
                 Intent.FLAG_ACTIVITY_NEW_TASK
                         | Intent.FLAG_ACTIVITY_NO_ANIMATION
                         | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
+        WakeActivity.allowWake();
+        WakeActivity.prepare(intent);
         try { startActivity(intent); }
-        catch (RuntimeException error) { fail(id, "wake_activity_rejected"); return; }
+        catch (RuntimeException error) { WakeActivity.cancelLaunch(intent); fail(id, "wake_activity_rejected"); return; }
         handler.postDelayed(() -> awaitWakeAndCapture(id, options, 0), WAKE_RETRY_DELAY_MS);
     }
 
@@ -241,7 +333,7 @@ public final class PhoneAccessibilityService extends AccessibilityService {
         GestureDescription gesture = new GestureDescription.Builder()
                 .addStroke(new GestureDescription.StrokeDescription(path, 0L, 350L))
                 .build();
-        boolean accepted = dispatchGesture(gesture, new GestureResultCallback() {
+        boolean accepted = dispatchTrackedGesture(gesture, new GestureResultCallback() {
             @Override public void onCompleted(GestureDescription description) {
                 handler.postDelayed(
                         () -> awaitWakeAndCapture(id, options, 0),
@@ -250,7 +342,7 @@ public final class PhoneAccessibilityService extends AccessibilityService {
             @Override public void onCancelled(GestureDescription description) {
                 fail(id, "wake_unlock_gesture_cancelled");
             }
-        }, handler);
+        }, false);
         if (!accepted) fail(id, "wake_unlock_gesture_rejected");
     }
 
@@ -326,11 +418,35 @@ public final class PhoneAccessibilityService extends AccessibilityService {
     }
 
     private void launch(String id, String packageName, ScreenshotOptions options) {
+        if(BridgeClient.rootAvailable(this)) {
+            DeviceCommandWorker.launchApp(packageName,ok -> handler.post(() -> {
+                if(!current(id))return;
+                if(!ok){fail(id,"app_launch_rejected");return;}
+                handler.postDelayed(() -> {
+                    if(!current(id))return;
+                    if(!packageName.equals(currentPackage())){fail(id,"app_launch_not_foreground");return;}
+                    capture(id,options);
+                },250L);
+            }));
+            return;
+        }
         Intent intent = getPackageManager().getLaunchIntentForPackage(packageName);
         if (intent == null) { fail(id, "app_launch_intent_missing"); return; }
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+        if(!ScreenStreamClient.UI_BARRIER.begin(ScreenStreamClient.UI_BARRIER.token())) {
+            fail(id,"screen_control_taken"); return;
+        }
+        ManagedIntentLaunchPolicy pending=new ManagedIntentLaunchPolicy(packageName,SystemClock.elapsedRealtime());
+        managedLaunches.add(pending);
         try { startActivity(intent); }
-        catch (RuntimeException error) { fail(id, "app_launch_rejected"); return; }
+        catch (RuntimeException error) {
+            managedLaunches.remove(pending); ScreenStreamClient.UI_BARRIER.end();
+            fail(id, "app_launch_rejected"); return;
+        }
+        // These callbacks belong to the launch, not the command: failure, cancellation or
+        // service replacement must still drain its barrier exactly once.
+        gestureCallbacks.postDelayed(this::settleOwnManagedLaunches,ManagedIntentLaunchPolicy.SETTLE_MS);
+        gestureCallbacks.postDelayed(this::settleOwnManagedLaunches,ManagedIntentLaunchPolicy.MAX_WAIT_MS);
         handler.postDelayed(() -> {
             if (!id.equals(activeId)) return;
             if (!packageName.equals(currentPackage())) { fail(id, "app_launch_not_foreground"); return; }
@@ -465,21 +581,25 @@ public final class PhoneAccessibilityService extends AccessibilityService {
         Path path = new Path(); path.moveTo(x1, y1); if (x1 != x2 || y1 != y2) path.lineTo(x2, y2);
         GestureDescription gesture = new GestureDescription.Builder()
                 .addStroke(new GestureDescription.StrokeDescription(path, 0L, duration)).build();
-        boolean accepted = dispatchGesture(gesture, new GestureResultCallback() {
+        boolean accepted = dispatchTrackedGesture(gesture, new GestureResultCallback() {
             @Override public void onCompleted(GestureDescription description) {
                 handler.postDelayed(() -> capture(id, options), 900L);
             }
             @Override public void onCancelled(GestureDescription description) { fail(id, "gesture_cancelled"); }
-        }, handler);
+        }, false);
         if (!accepted) fail(id, "gesture_rejected");
     }
     private boolean inside(int x, int y) { return x >= 0 && y >= 0 && x < basisWidth && y < basisHeight; }
 
     private void capture(String id, ScreenshotOptions options) {
+        if(!current(id))return;
         if (options == null) { fail(id, "screenshot_options_missing"); return; }
         takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(), new TakeScreenshotCallback() {
-            @Override public void onSuccess(ScreenshotResult result) { encode(id, result, options); }
-            @Override public void onFailure(int errorCode) { fail(id, "screenshot_failed_" + errorCode); }
+            @Override public void onSuccess(ScreenshotResult result) {
+                if(!current(id)){result.getHardwareBuffer().close();return;}
+                encode(id, result, options);
+            }
+            @Override public void onFailure(int errorCode) { if(current(id))fail(id, "screenshot_failed_" + errorCode); }
         });
     }
 
@@ -507,6 +627,7 @@ public final class PhoneAccessibilityService extends AccessibilityService {
                     .put("display_width", displayWidth).put("display_height", displayHeight);
             int finalDisplayWidth = displayWidth, finalDisplayHeight = displayHeight;
             BridgeClient.postScreenshot(this, id, metadata, jpeg, uploaded -> handler.post(() -> {
+                if(!current(id))return;
                 if (uploaded) {
                     basisId = id; basisPackage = packageName; basisWidth = finalDisplayWidth;
                     basisHeight = finalDisplayHeight; basisCapturedAt = SystemClock.elapsedRealtime();

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "phone-for-ai"
-version = "0.1.2"
+version = "0.2.0"
 description = "A self-hosted bridge and stdio MCP for one Android phone"
 requires-python = ">=3.11"
 license = {text = "MIT"}
