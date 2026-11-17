@@ -64,7 +64,7 @@ The browser console is served at `/`. It keeps the operator token in memory, sen
 - Server sends JSON `status` (`waiting` or `connected`), `video` (`codec:"h264",width,height`), `error`, and `stopped`.
 - Video binary packets: 1 flag byte (bit0 config, bit1 keyframe), 8-byte big-endian microsecond timestamp, Annex-B H.264 payload. Limit 2 MiB. Browser uses WebCodecs, bounded decode queue, cached SPS/PPS, reset/keyframe recovery, and releases every decoded frame.
 - Controls: `{type:"touch",action:0|1|2|3,pointer_id:0..9,x,y,width,height}`, `{type:"key",keycode:3|4|187|24|25|66|67}`, `{type:"text",text:<at most 2000 characters>}`, `{type:"reset_video"}`. Touch coordinates use displayed video dimensions. Cancel active fingers before rotation, decoder reset, blur, failure, or stop.
-- A live authenticated viewer owns phone control. UI commands, launch, wake, clipboard and shell/file mutation must be blocked while viewing; creating/attaching a viewer rechecks command activity. No queued touch/text is replayed when reconnecting. Frames are relayed only; no video recording is created.
+- In public v0.1.2, an authenticated live viewer owns phone control immediately, even without sending input. There is no concurrent observe-only mode. All newly queued device commands are blocked while viewing, including screenshots and read-only device commands; status and existing command-result queries remain available. Creating/attaching a viewer rechecks command activity. No queued touch/text is replayed when reconnecting. Frames are relayed only; no video recording is created.
 
 ## Public scope
 
