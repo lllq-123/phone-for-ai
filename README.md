@@ -50,6 +50,8 @@ flowchart LR
 4. 把 `phone-for-ai mcp` 接到支持 MCP 和图片的 agent。
 5. 从一句「看看手机现在是什么页面」开始，再试搜索、填字、准备草稿。
 
+使用华为闲置机的读者可以参考两条用户实测：[nova 10 旧系统自行改包](docs/setup.md#华为-nova-10-的改包记录)、[充电时保持亮屏](docs/setup.md#华为手机充电时保持亮屏)。
+
 完整说明：
 
 - [安装、配对与 MCP 接入](docs/setup.md)
